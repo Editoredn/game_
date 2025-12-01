@@ -1,0 +1,531 @@
+% maze_pursuit_game_UI_enhanced_fixed2.m
+% Enhanced Maze Pursuit Game — Fixed version (patch for 'end' indexing bug)
+% Save and run: >> maze_pursuit_game_UI_enhanced_fixed2
+
+function pursuit_game
+    close all; rng('shuffle');
+
+    % ---------- PARAMETERS ----------
+    cellSize = 1; rows = 21; cols = 29;
+    dt = 0.04; playerStep = 0.45; playerRot = pi/8;
+    killerSpeed = 0.6; captureRadius = 0.35; losSamples = 20;
+    agentRadius = 0.25;
+
+    % ---------- BUILD SIMPLE MAZE ----------
+    M = ones(rows,cols);
+    for r = 2:rows-1, for c = 2:cols-1, M(r,c) = 0; end, end
+    for r = 3:2:rows-2
+        for c = 3:2:cols-2
+            M(r,c) = 1;
+            if rand > 0.3
+                dir = randi(4);
+                switch dir
+                    case 1, M(r-1,c)=1;
+                    case 2, M(r+1,c)=1;
+                    case 3, M(r,c-1)=1;
+                    case 4, M(r,c+1)=1;
+                end
+            end
+        end
+    end
+    M(1,:) = 1; M(rows,:) = 1; M(:,1) = 1; M(:,cols) = 1;
+    % add corridors for playability
+    M(2,3)=0; M(3,3)=0; M(4,3)=0; M(4,4)=0; M(4,5)=0;
+    M(6,5)=0; M(6,6)=0; M(7,6)=0; M(7,7)=0; M(8,7)=0;
+    M(10,9)=0; M(11,9)=0; M(11,10)=0; M(12,10)=0; M(13,10)=0;
+    M(15,12)=0; M(16,12)=0; M(16,13)=0; M(16,14)=0;
+    M(18,16)=0; M(18,17)=0; M(18,18)=0; M(17,18)=0; M(16,18)=0;
+    M(8,20)=0; M(9,20)=0; M(10,20)=0; M(11,20)=0; M(12,20)=0;
+    M(4,24)=0; M(5,24)=0; M(6,24)=0; M(7,24)=0; M(8,24)=0;
+
+    % ---------- START / EXIT / AGENTS ----------
+    startCell = [2,2]; exitCell = [rows-1, cols-1];
+    midr = round(rows/2); midc = round(cols/3);
+    killerCell = findNearestFree(M, midr, midc);
+    player.pos = cellToXY(startCell, cellSize); player.theta = 0;
+    killer.pos = cellToXY(killerCell, cellSize); killer.theta = pi; killer.v = killerSpeed;
+
+    % ---------- PREPARE SOUNDS ----------
+    hasHandel = false;
+    try
+        load handel.mat; % loads y, Fs
+        hasHandel = exist('y','var') && exist('Fs','var');
+    catch
+        hasHandel = false;
+    end
+    % fallback tones
+    tTone = linspace(0,0.25,round(0.25*8192));
+    winTone = sin(2*pi*880*tTone) .* (linspace(0,1,length(tTone)).^0.9)';
+    loseTone = sin(2*pi*220*tTone) .* (linspace(1,0,length(tTone)).^0.9)';
+
+    % ---------- FIGURE & UI (manual layout to avoid uix dependency) ----------
+    fig = figure('Name','Maze Pursuit — UI (Fixed)','NumberTitle','off', ...
+        'Color',[0.96 0.96 0.96], 'MenuBar','none','ToolBar','none', ...
+        'WindowKeyPressFcn',@windowKeyDown,'CloseRequestFcn',@onClose, ...
+        'Units','normalized','Position',[0.1 0.08 0.8 0.8]);
+
+    % left axes (game) 70% width, right control panel 28%
+    axPos = [0.02 0.03 0.68 0.94];
+    cpPos = [0.72 0.03 0.26 0.94];
+    ax = axes('Parent',fig,'Position',axPos);
+    controlPanel = uipanel('Parent',fig,'Units','normalized','Position',cpPos,'Title','Controls');
+
+    % draw maze walls
+    hold(ax,'on'); axis(ax,'equal'); axis(ax,'off');
+    [wallX, wallY] = mazeToRects(M, cellSize);
+    for k = 1:length(wallX)
+        rectangle('Position',[wallX{k}(1), wallY{k}(1), cellSize, cellSize],...
+            'FaceColor',[0.2 0.2 0.2],'EdgeColor','none','Parent',ax);
+    end
+    exitXY = cellToXY(exitCell, cellSize);
+    rectangle('Position',[exitXY(1)-cellSize/2, exitXY(2)-cellSize/2, cellSize, cellSize],...
+        'FaceColor',[0.6 1 0.6],'EdgeColor',[0 0.6 0],'LineWidth',1.5,'Parent',ax);
+
+    % agents graphics
+    hPlayer = plot(ax, player.pos(1), player.pos(2), 'bo','MarkerFaceColor','b','MarkerSize',10);
+    hKiller = plot(ax, killer.pos(1), killer.pos(2), 'ro','MarkerFaceColor','r','MarkerSize',10);
+    hPdir = line(ax, [0 0],[0 0],'Color','b','LineWidth',1.5);
+    hKdir = line(ax, [0 0],[0 0],'Color','r','LineWidth',1.5);
+    pTrail = animatedline(ax,'Color','b','LineWidth',1);
+    kTrail = animatedline(ax,'Color','r','LineWidth',1);
+    xlim(ax,[0 cellSize*cols]); ylim(ax,[0 cellSize*rows]);
+
+    % ---------- CONTROL PANEL CONTENT (absolute positions inside panel) ----------
+    set(controlPanel,'Units','pixels');
+    cpPosPixels = get(controlPanel,'Position');
+    cpW = cpPosPixels(3); cpH = cpPosPixels(4);
+
+    % button sizes and spacing
+    bw = 70; bh = 36; margin = 14;
+    leftX = 12; topY = cpH - 60;
+
+    % WASD buttons (grouped)
+    btnW_h = uicontrol('Parent',controlPanel,'Style','pushbutton','String','W','FontSize',14, ...
+        'Position',[leftX+80 topY-20 bw bh],'Callback',@btnW_callback);
+    btnA_h = uicontrol('Parent',controlPanel,'Style','pushbutton','String','A','FontSize',14, ...
+        'Position',[leftX+12 topY-70 bw bh],'Callback',@btnA_callback);
+    btnS_h = uicontrol('Parent',controlPanel,'Style','pushbutton','String','S','FontSize',14, ...
+        'Position',[leftX+80 topY-70 bw bh],'Callback',@btnS_callback);
+    btnD_h = uicontrol('Parent',controlPanel,'Style','pushbutton','String','D','FontSize',14, ...
+        'Position',[leftX+148 topY-70 bw bh],'Callback',@btnD_callback);
+
+    % Start / Stop / Reset / Step buttons
+    btnStart_h = uicontrol('Parent',controlPanel,'Style','pushbutton','String','Start','FontSize',12, ...
+        'Position',[leftX topY-140 bw bh],'Callback',@onStart);
+    btnStop_h  = uicontrol('Parent',controlPanel,'Style','pushbutton','String','Stop','FontSize',12, ...
+        'Position',[leftX+80 topY-140 bw bh],'Callback',@onStop);
+    btnReset_h = uicontrol('Parent',controlPanel,'Style','pushbutton','String','Reset','FontSize',12, ...
+        'Position',[leftX+160 topY-140 bw bh],'Callback',@onReset);
+    btnStep_h  = uicontrol('Parent',controlPanel,'Style','pushbutton','String','Step →','FontSize',12, ...
+        'Position',[leftX+80 topY-190 bw bh],'Callback',@onStep);
+
+    % status text & time text
+    statusTxt = uicontrol('Parent',controlPanel,'Style','text','String','Status: Ready','FontSize',10,'HorizontalAlignment','left',...
+        'Position',[leftX 20 cpW-2*leftX 36]);
+    timeTxt   = uicontrol('Parent',controlPanel,'Style','text','String','Time: 0.00 s','FontSize',10,'HorizontalAlignment','left',...
+        'Position',[leftX 60 cpW-2*leftX 20]);
+
+    % progress bar background + fill (we will update fill width)
+    progBg = uicontrol('Parent',controlPanel,'Style','text','Enable','inactive','BackgroundColor',[0.8 0.8 0.8],...
+        'Position',[leftX cpH-40 cpW-2*leftX 14]);
+    posBg = get(progBg,'Position'); % [x y w h]
+    progFill = uicontrol('Parent',controlPanel,'Style','text','Enable','inactive','BackgroundColor',[0.2 0.7 0.2],...
+        'Position',[posBg(1) posBg(2) 1 posBg(4)]);
+
+    % overlay for End screens (hidden)
+    overlayPanel = uipanel('Parent',fig,'Units','normalized','Position',[0 0 1 1],'BackgroundColor',[0 0 0 0.5],'Visible','off');
+    overlayText = uicontrol('Parent',overlayPanel,'Style','text','String','','FontSize',28,'FontWeight','bold','ForegroundColor','w',...
+        'BackgroundColor','none','Units','normalized','Position',[0.25 0.55 0.5 0.2],'HorizontalAlignment','center');
+    overlayMsg = uicontrol('Parent',overlayPanel,'Style','text','String','','FontSize',12,'ForegroundColor','w',...
+        'BackgroundColor','none','Units','normalized','Position',[0.25 0.45 0.5 0.08],'HorizontalAlignment','center');
+    overlayBtnRestart = uicontrol('Parent',overlayPanel,'Style','pushbutton','String','Restart Level','FontSize',12,'Units','normalized',...
+        'Position',[0.35 0.32 0.12 0.07],'Callback',@onReset);
+    overlayBtnQuit = uicontrol('Parent',overlayPanel,'Style','pushbutton','String','Quit','FontSize',12,'Units','normalized',...
+        'Position',[0.53 0.32 0.12 0.07],'Callback',@onQuit);
+
+    % ---------- GAME STATE ----------
+    keys = struct('w',false,'a',false,'s',false,'d',false);
+    running = false; stopRequested = false; t = 0;
+    killerState = 'patrol'; patrolTarget = []; chasePath = []; chaseIndex = 1;
+    pathRecomputeInterval = 0.6; lastPathTime = -inf;
+    freeCells = find(M==0); [freeR,freeC] = ind2sub(size(M), freeCells); freeCoords = [freeR,freeC];
+
+    maxDist = hypot((cols-1)*cellSize, (rows-1)*cellSize);
+
+    % ---------- MAIN LOOP ----------
+    while ishandle(fig) && ~stopRequested
+        if running
+            % killer perception and AI
+            los = hasLineOfSight(killer.pos, player.pos, M, cellSize, losSamples);
+            if los
+                killerState = 'chase';
+                if toc(lastPathTime) > pathRecomputeInterval || isempty(chasePath)
+                    startCellK = xyToCell(killer.pos, cellSize);
+                    targetCellP = xyToCell(player.pos, cellSize);
+                    chasePath = astar_grid(M, startCellK, targetCellP);
+                    chaseIndex = 1;
+                    lastPathTime = tic;
+                end
+            else
+                if ~strcmp(killerState,'patrol'), killerState = 'patrol'; chasePath = []; chaseIndex = 1; end
+            end
+
+            % killer movement
+            if strcmp(killerState,'patrol')
+                if isempty(patrolTarget) || rand < 0.01
+                    idx = randi(size(freeCoords,1)); patrolTarget = freeCoords(idx,:);
+                end
+                targetXY = cellToXY(patrolTarget, cellSize);
+                dir = targetXY - killer.pos;
+                if norm(dir) < 0.2
+                    patrolTarget = [];
+                else
+                    killer.theta = atan2(dir(2), dir(1));
+                    newK = killer.pos + [cos(killer.theta), sin(killer.theta)]*killer.v*dt;
+                    if ~pointInWalls(newK, M, cellSize, agentRadius)
+                        killer.pos = newK;
+                    end
+                end
+            else
+                if ~isempty(chasePath)
+                    if chaseIndex <= size(chasePath,1)
+                        node = chasePath(chaseIndex,:);
+                        nodeXY = cellToXY(node,cellSize);
+                        dir = nodeXY - killer.pos;
+                        if norm(dir) < 0.18
+                            chaseIndex = chaseIndex + 1;
+                        else
+                            killer.theta = atan2(dir(2), dir(1));
+                            newK = killer.pos + [cos(killer.theta), sin(killer.theta)]*killer.v*dt;
+                            if ~pointInWalls(newK, M, cellSize, agentRadius)
+                                killer.pos = newK;
+                            else
+                                chasePath = [];
+                            end
+                        end
+                    else
+                        dir = player.pos - killer.pos;
+                        killer.theta = atan2(dir(2), dir(1));
+                        newK = killer.pos + [cos(killer.theta), sin(killer.theta)]*killer.v*dt;
+                        if ~pointInWalls(newK, M, cellSize, agentRadius)
+                            killer.pos = newK;
+                        end
+                    end
+                else
+                    dir = player.pos - killer.pos;
+                    killer.theta = atan2(dir(2), dir(1));
+                    newK = killer.pos + [cos(killer.theta), sin(killer.theta)]*killer.v*dt;
+                    if ~pointInWalls(newK, M, cellSize, agentRadius)
+                        killer.pos = newK;
+                    end
+                end
+            end
+
+            % PLAYER discrete actions (consume flags)
+            if keys.a
+                player.theta = player.theta + playerRot; keys.a = false;
+            end
+            if keys.d
+                player.theta = player.theta - playerRot; keys.d = false;
+            end
+            if keys.w
+                newP = player.pos + [cos(player.theta), sin(player.theta)]*playerStep;
+                if ~pointInWalls(newP, M, cellSize, agentRadius)
+                    player.pos = newP;
+                end
+                keys.w = false;
+            end
+            if keys.s
+                newP = player.pos - [cos(player.theta), sin(player.theta)]*playerStep;
+                if ~pointInWalls(newP, M, cellSize, agentRadius)
+                    player.pos = newP;
+                end
+                keys.s = false;
+            end
+
+            % update visuals
+            addpoints(pTrail, player.pos(1), player.pos(2));
+            addpoints(kTrail, killer.pos(1), killer.pos(2));
+            set(hPlayer,'XData',player.pos(1),'YData',player.pos(2));
+            set(hKiller,'XData',killer.pos(1),'YData',killer.pos(2));
+            set(hPdir,'XData',[player.pos(1), player.pos(1)+0.5*cos(player.theta)], ...
+                      'YData',[player.pos(2), player.pos(2)+0.5*sin(player.theta)]);
+            set(hKdir,'XData',[killer.pos(1), killer.pos(1)+0.5*cos(killer.theta)], ...
+                      'YData',[killer.pos(2), killer.pos(2)+0.5*sin(killer.theta)]);
+            drawnow limitrate;
+
+            % checks: capture or exit
+            d = norm(player.pos - killer.pos);
+            if d <= captureRadius
+                running = false;
+                showOverlay('You Died!', sprintf('Caught after %.2f s', t), 'lose');
+            else
+                if norm(player.pos - exitXY) < cellSize*0.45
+                    running = false;
+                    showOverlay('You Won!', sprintf('Escaped in %.2f s', t), 'win');
+                else
+                    % update status/time/progress
+                    set(statusTxt,'String',sprintf('State: %s', killerState));
+                    set(timeTxt,'String',sprintf('Time: %.2f s', t));
+                    distExit = norm(player.pos - exitXY);
+                    frac = max(0, min(1, 1 - distExit / maxDist));
+                    posBg = get(progBg,'Position'); % [x y w h]
+                    widthTotal = posBg(3);
+                    newW = max(1, round(widthTotal * frac));
+                    set(progFill,'Position',[posBg(1) posBg(2) newW posBg(4)]);
+                end
+            end
+
+            t = t + dt;
+        else
+            pause(0.06);
+        end
+    end
+
+    if ishandle(fig), delete(fig); end
+
+    % ---------- CALLBACKS & UI handlers ----------
+    function windowKeyDown(~, ev)
+        k = lower(ev.Key);
+        switch k
+            case 'w', keys.w = true;
+            case 'a', keys.a = true;
+            case 's', keys.s = true;
+            case 'd', keys.d = true;
+            case 'escape', stopRequested = true; delete(fig);
+            case 'r', onReset();
+            case 'space', keys.w = true;
+        end
+    end
+
+    function btnW_callback(~,~), keys.w = true; end
+    function btnA_callback(~,~), keys.a = true; end
+    function btnS_callback(~,~), keys.s = true; end
+    function btnD_callback(~,~), keys.d = true; end
+
+    function onStart(~,~)
+        clearpoints(pTrail); clearpoints(kTrail);
+        addpoints(pTrail, player.pos(1), player.pos(2));
+        addpoints(kTrail, killer.pos(1), killer.pos(2));
+        running = true; t = 0;
+        set(statusTxt,'String','State: running');
+        set(overlayPanel,'Visible','off');
+    end
+
+    function onStop(~,~)
+        running = false; set(statusTxt,'String','Paused');
+    end
+
+    function onReset(~,~)
+        player.pos = cellToXY(startCell, cellSize); player.theta = 0;
+        killer.pos = cellToXY(killerCell, cellSize); killer.theta = pi;
+        clearpoints(pTrail); clearpoints(kTrail);
+        addpoints(pTrail, player.pos(1), player.pos(2));
+        addpoints(kTrail, killer.pos(1), killer.pos(2));
+        running = false; t = 0;
+        set(statusTxt,'String','Reset. Press Start.');
+        set(timeTxt,'String','Time: 0.00 s');
+        posBg = get(progBg,'Position'); % safe indexing
+        set(progFill,'Position',[posBg(1) posBg(2) 1 posBg(4)]);
+        set(overlayPanel,'Visible','off');
+    end
+
+    function onStep(~,~)
+        keys.w = true;
+        if ~running
+            runFor = 6;
+            for i = 1:runFor
+                los = hasLineOfSight(killer.pos, player.pos, M, cellSize, losSamples);
+                if los
+                    killerState = 'chase';
+                    if toc(lastPathTime) > pathRecomputeInterval || isempty(chasePath)
+                        startCellK = xyToCell(killer.pos, cellSize);
+                        targetCellP = xyToCell(player.pos, cellSize);
+                        chasePath = astar_grid(M, startCellK, targetCellP);
+                        chaseIndex = 1;
+                        lastPathTime = tic;
+                    end
+                else
+                    if ~strcmp(killerState,'patrol'), killerState='patrol'; chasePath=[]; chaseIndex=1; end
+                end
+                if strcmp(killerState,'patrol')
+                    if isempty(patrolTarget) || rand<0.01
+                        idx = randi(size(freeCoords,1)); patrolTarget = freeCoords(idx,:);
+                    end
+                    targetXY = cellToXY(patrolTarget, cellSize);
+                    dir = targetXY - killer.pos;
+                    if norm(dir) < 0.2, patrolTarget = []; else
+                        killer.theta = atan2(dir(2),dir(1));
+                        newK = killer.pos + [cos(killer.theta), sin(killer.theta)]*killer.v*dt;
+                        if ~pointInWalls(newK,M,cellSize,agentRadius), killer.pos = newK; end
+                    end
+                else
+                    if ~isempty(chasePath) && chaseIndex <= size(chasePath,1)
+                        node = chasePath(chaseIndex,:); nodeXY = cellToXY(node,cellSize);
+                        dir = nodeXY - killer.pos;
+                        if norm(dir) < 0.18, chaseIndex = chaseIndex + 1;
+                        else killer.theta = atan2(dir(2),dir(1));
+                            newK = killer.pos + [cos(killer.theta), sin(killer.theta)]*killer.v*dt;
+                            if ~pointInWalls(newK,M,cellSize,agentRadius), killer.pos = newK; else chasePath = []; end
+                        end
+                    else
+                        dir = player.pos - killer.pos; killer.theta = atan2(dir(2),dir(1));
+                        newK = killer.pos + [cos(killer.theta), sin(killer.theta)]*killer.v*dt;
+                        if ~pointInWalls(newK,M,cellSize,agentRadius), killer.pos = newK; end
+                    end
+                end
+                if keys.w
+                    newP = player.pos + [cos(player.theta), sin(player.theta)]*playerStep;
+                    if ~pointInWalls(newP,M,cellSize,agentRadius), player.pos = newP; end
+                    keys.w = false;
+                end
+                addpoints(pTrail, player.pos(1), player.pos(2));
+                addpoints(kTrail, killer.pos(1), killer.pos(2));
+                set(hPlayer,'XData',player.pos(1),'YData',player.pos(2));
+                set(hKiller,'XData',killer.pos(1),'YData',killer.pos(2));
+                drawnow limitrate;
+                t = t + dt;
+            end
+        end
+    end
+
+    function onQuit(~,~)
+        stopRequested = true; if ishandle(fig), delete(fig); end
+    end
+
+    function onClose(~,~)
+        stopRequested = true; if ishandle(fig), delete(fig); end
+    end
+
+    function showOverlay(titleStr, msgStr, kind)
+        set(overlayText,'String',titleStr);
+        set(overlayMsg,'String',msgStr);
+        set(overlayPanel,'Visible','on');
+        drawnow;
+        if strcmp(kind,'win')
+            try
+                if hasHandel
+                    sound(y, Fs);
+                else
+                    sound(winTone,8192);
+                end
+            catch
+                beep;
+            end
+        else
+            try
+                if hasHandel
+                    % use length(y) instead of 'end' token
+                    n = length(y);
+                    len = max(1, round(n * 0.12));
+                    sound(y(1:len), Fs);
+                else
+                    sound(loseTone,8192);
+                end
+            catch
+                beep;
+            end
+        end
+    end
+
+    % ---------- HELPER FUNCTIONS ----------
+    function b = pointInWalls(pt, Mgrid, cs, radius)
+        angs = linspace(0,2*pi,12); b=false;
+        for a=angs
+            p = pt + radius*[cos(a), sin(a)];
+            [r,c] = xyToCellIndices(p, cs);
+            if r<1 || r>size(Mgrid,1) || c<1 || c>size(Mgrid,2) || Mgrid(r,c)==1
+                b = true; return;
+            end
+        end
+    end
+
+    function yes = hasLineOfSight(p1,p2,Mgrid,cs,samples)
+        yes = true;
+        for s = linspace(0,1,samples)
+            p = (1-s)*p1 + s*p2; [r,c] = xyToCellIndices(p,cs);
+            if r<1 || r>size(Mgrid,1) || c<1 || c>size(Mgrid,2) || Mgrid(r,c)==1
+                yes = false; return;
+            end
+        end
+    end
+
+    function xy = cellToXY(cellRC, cs)
+        xy = [(cellRC(2)-0.5)*cs, (cellRC(1)-0.5)*cs];
+    end
+
+    function [r,c] = xyToCellIndices(pt, cs)
+        c = floor(pt(1)/cs) + 1; r = floor(pt(2)/cs) + 1;
+    end
+
+    function cellRC = xyToCell(pt, cs)
+        [r,c] = xyToCellIndices(pt, cs); r = max(1,min(rows,r)); c = max(1,min(cols,c)); cellRC = [r,c];
+    end
+
+    function idx = findNearestFree(Mgrid, r0, c0)
+        best=[]; bestd=inf;
+        for r=1:size(Mgrid,1)
+            for c=1:size(Mgrid,2)
+                if Mgrid(r,c)==0
+                    d = hypot(r-r0, c-c0);
+                    if d < bestd, best=[r,c]; bestd=d; end
+                end
+            end
+        end
+        idx = best;
+    end
+
+    function [rectsX, rectsY] = mazeToRects(Mgrid, cs)
+        [rlist, clist] = find(Mgrid==1);
+        n = length(rlist); rectsX = cell(1,n); rectsY = cell(1,n);
+        for i=1:n, rectsX{i} = (clist(i)-1)*cs; rectsY{i} = (rlist(i)-1)*cs; end
+    end
+
+    % ---------- A* (compact) ----------
+    function path = astar_grid(Mgrid, startRC, goalRC)
+        rowsz=size(Mgrid,1); colsz=size(Mgrid,2);
+        sidx=sub2ind([rowsz,colsz], startRC(1), startRC(2));
+        gidx=sub2ind([rowsz,colsz], goalRC(1), goalRC(2));
+        if Mgrid(goalRC(1),goalRC(2))==1, path=[]; return; end
+        openSet = containers.Map('KeyType','double','ValueType','double');
+        gscore=inf(rowsz*colsz,1); fscore=inf(rowsz*colsz,1); cameFrom=zeros(rowsz*colsz,1);
+        gscore(sidx)=0; fscore(sidx)=heuristic(startRC,goalRC); openSet(sidx)=fscore(sidx);
+        while ~isempty(openSet)
+            keysOpen = cell2mat(keys(openSet)); valsOpen = cell2mat(values(openSet));
+            [~,mi] = min(valsOpen); minKey = keysOpen(mi);
+            if minKey == gidx
+                cur=minKey; rev=[];
+                while cur~=0
+                    [rr,cc] = ind2sub([rowsz,colsz], cur);
+                    rev(end+1,:) = [rr,cc]; %#ok<AGROW>
+                    cur = cameFrom(cur);
+                end
+                rev = flipud(rev);
+                if size(rev,1) >= 2, path = rev(2:end,:); else path = []; end
+                return;
+            end
+            remove(openSet, minKey);
+            [cr,cc] = ind2sub([rowsz,colsz], minKey);
+            neighbors = [cr-1,cc; cr+1,cc; cr,cc-1; cr,cc+1];
+            for k = 1:4
+                nr = neighbors(k,1); nc = neighbors(k,2);
+                if nr<1 || nr>rowsz || nc<1 || nc>colsz, continue; end
+                if Mgrid(nr,nc) == 1, continue; end
+                nidx = sub2ind([rowsz,colsz], nr, nc);
+                tentative = gscore(minKey) + 1;
+                if tentative < gscore(nidx)
+                    cameFrom(nidx) = minKey;
+                    gscore(nidx) = tentative;
+                    fscore(nidx) = tentative + heuristic([nr,nc], goalRC);
+                    openSet(nidx) = fscore(nidx);
+                end
+            end
+        end
+        path = [];
+    end
+
+    function h = heuristic(a,b)
+        h = abs(a(1)-b(1)) + abs(a(2)-b(2));
+    end
+
+end
